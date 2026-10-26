@@ -130,21 +130,23 @@ class InboundAdmission:
             self.active_keys.add(execution_key)
             self.ready.put_nowait((execution_key, frames))
 
-    async def _release(self, frames: list[bytes]) -> None:
+    async def _release(self, frame_count: int, frame_bytes: int) -> None:
         async with self.capacity_changed:
-            self.retained_frames = max(0, self.retained_frames - len(frames))
-            self.retained_bytes = max(0, self.retained_bytes - sum(map(len, frames)))
+            self.retained_frames = max(0, self.retained_frames - frame_count)
+            self.retained_bytes = max(0, self.retained_bytes - frame_bytes)
             self.capacity_changed.notify_all()
 
     async def _pipeline_loop(self) -> None:
         while True:
             key, frames = await self.ready.get()
+            frame_count = len(frames)
+            frame_bytes = sum(map(len, frames))
             try:
                 await self._adapter._inbound_pipeline.execute(self._context_factory(frames))
             except Exception:
                 logger.exception("[%s] Inbound pipeline failed for key=%s", self._adapter.name, key)
             finally:
-                await self._release(frames)
+                await self._release(frame_count, frame_bytes)
                 pending = self.pending.get(key)
                 if self.accepting and pending:
                     self.ready.put_nowait((key, pending.popleft()))

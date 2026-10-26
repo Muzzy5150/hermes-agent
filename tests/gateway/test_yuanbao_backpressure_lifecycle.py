@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
-from plugins.platforms.yuanbao.adapter import DispatchMiddleware, InboundContext, YuanbaoAdapter
+from plugins.platforms.yuanbao.adapter import (
+    AccessPolicy,
+    DispatchMiddleware,
+    InboundContext,
+    YuanbaoAdapter,
+)
 from plugins.platforms.yuanbao.inbound_capacity import (
     GROUP_GLOBAL_MAX_BYTES,
     GROUP_GLOBAL_MAX_MESSAGES,
@@ -38,6 +43,161 @@ def _group_context(adapter: YuanbaoAdapter, source, index: int) -> InboundContex
         source=source,
         msg_type=MessageType.TEXT,
     )
+
+
+def _valid_dm_frame(index: int) -> bytes:
+    return json.dumps(
+        {
+            "CallbackCommand": "C2C.CallbackAfterSendMsg",
+            "From_Account": "alice",
+            "To_Account": "bot_123",
+            "MsgBody": [
+                {"MsgType": "TIMTextElem", "MsgContent": {"text": f"message {index}"}}
+            ],
+            "MsgKey": f"capacity-{index}",
+        }
+    ).encode()
+
+
+def _authorized_adapter(monkeypatch) -> YuanbaoAdapter:
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    adapter = _adapter()
+    adapter._bot_id = "bot_123"
+    adapter._access_policy = AccessPolicy(
+        dm_policy="open", dm_allow_from=[], group_policy="open", group_allow_from=[]
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._resolve_inbound_media_urls = AsyncMock(return_value=([], []))
+    adapter._connection._DEBOUNCE_WINDOW = 3600
+    return adapter
+
+
+async def _flush_frame(connection, frame: bytes) -> None:
+    key = connection._extract_sender_key(frame)
+    await async_wait_until(
+        lambda: key in connection._inbound_admission.buffer,
+        what="the admitted frame to reach its debounce buffer",
+    )
+    connection._flush_inbound_buffer(key)
+
+
+@pytest.mark.asyncio
+async def test_raw_admission_releases_capacity_after_real_dispatch(monkeypatch):
+    adapter = _authorized_adapter(monkeypatch)
+    connection = adapter._connection
+    admission = connection._inbound_admission
+    frame = _valid_dm_frame(1)
+
+    try:
+        assert await connection._push_to_inbound(frame)
+        await _flush_frame(connection, frame)
+        await async_wait_until(
+            lambda: adapter.handle_message.await_count == 1,
+            what="the valid authorized message to dispatch",
+        )
+        await async_wait_until(
+            lambda: not admission.active_keys,
+            what="the inbound pipeline batch to finish",
+        )
+
+        assert admission.retained_frames == 0
+        assert admission.retained_bytes == 0
+    finally:
+        await admission.close()
+
+
+@pytest.mark.asyncio
+async def test_more_than_frame_capacity_processes_without_wedging(monkeypatch):
+    adapter = _authorized_adapter(monkeypatch)
+    connection = adapter._connection
+    admission = connection._inbound_admission
+
+    async def produce() -> None:
+        for index in range(80):
+            frame = _valid_dm_frame(index)
+            assert await connection._push_to_inbound(frame)
+            await _flush_frame(connection, frame)
+
+    producer = asyncio.create_task(produce())
+    try:
+        await async_wait_until(
+            producer.done,
+            timeout=3,
+            what="more than one full raw-admission window to process",
+        )
+        await producer
+        await async_wait_until(
+            lambda: adapter.handle_message.await_count == 80,
+            what="all repeated valid messages to dispatch",
+        )
+        await async_wait_until(
+            lambda: not admission.active_keys,
+            what="all repeated pipeline batches to finish",
+        )
+        assert admission.retained_frames == 0
+        assert admission.retained_bytes == 0
+    finally:
+        producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+        await admission.close()
+
+
+@pytest.mark.asyncio
+async def test_mutated_batch_releases_capacity_after_pipeline_exception():
+    adapter = _adapter()
+    connection = adapter._connection
+    admission = connection._inbound_admission
+    connection._DEBOUNCE_WINDOW = 3600
+    frame = b"exception-payload"
+
+    class MutatingFailure:
+        async def execute(self, ctx):
+            ctx.raw_frames.clear()
+            raise RuntimeError("expected test failure")
+
+    adapter._inbound_pipeline = MutatingFailure()
+    try:
+        assert await connection._push_to_inbound(frame)
+        await _flush_frame(connection, frame)
+        await async_wait_until(
+            lambda: not admission.active_keys,
+            what="the failing pipeline batch to finish",
+        )
+        assert admission.retained_frames == 0
+        assert admission.retained_bytes == 0
+    finally:
+        await admission.close()
+
+
+@pytest.mark.asyncio
+async def test_mutated_batch_releases_capacity_on_pipeline_cancellation():
+    adapter = _adapter()
+    connection = adapter._connection
+    admission = connection._inbound_admission
+    connection._DEBOUNCE_WINDOW = 3600
+    started = asyncio.Event()
+    frame = b"cancellation-payload"
+
+    class MutatingBlockedPipeline:
+        async def execute(self, ctx):
+            ctx.raw_frames.clear()
+            started.set()
+            await asyncio.Event().wait()
+
+    adapter._inbound_pipeline = MutatingBlockedPipeline()
+    try:
+        assert await connection._push_to_inbound(frame)
+        await _flush_frame(connection, frame)
+        await started.wait()
+        workers = list(admission.pipeline_tasks)
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+        assert admission.retained_frames == 0
+        assert admission.retained_bytes == 0
+    finally:
+        await admission.close()
 
 
 @pytest.mark.asyncio
