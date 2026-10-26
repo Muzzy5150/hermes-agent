@@ -23,6 +23,7 @@ import {
 } from '@/store/pet'
 import { resetPetGallery, setPetScale } from '@/store/pet-gallery'
 import { $petOverlayActive, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
@@ -104,6 +105,7 @@ export function FloatingPet() {
   const { requestGateway } = useGatewayRequest()
   const { resolvedMode } = useTheme()
   const gatewayState = useStore($gatewayState)
+  const gatewayProfile = useStore($activeGatewayProfile)
   const info = useStore($petInfo)
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const petChange = useStore($petChange)
@@ -144,22 +146,13 @@ export function FloatingPet() {
     }
 
     let cancelled = false
-
-    // pet.changed already carries the meta payload — an enabled=false
-    // broadcast clears the mascot with zero round-trips, and an unchanged
-    // revision (scale-only move still changes the sig) short-circuits below
-    // via hasPetSpriteForMeta + mergePetInfoMeta.
-    if (changeEventsAvailable && petChange.tick > 0 && petChange.meta?.enabled === false) {
-      setPetInfo({ enabled: false })
-
-      return
-    }
+    const profile = petProfile()
 
     const pull = async () => {
       try {
         if (active) {
           try {
-            const meta = await requestGateway<PetInfoMeta>('pet.info.meta', { profile: petProfile() })
+            const meta = await requestGateway<PetInfoMeta>('pet.info.meta', { profile })
 
             if (cancelled || !meta) {
               return
@@ -174,15 +167,15 @@ export function FloatingPet() {
             const current = $petInfo.get()
 
             if (hasPetSpriteForMeta(current, meta)) {
-              const merged = mergePetInfoMeta(current, meta)
-
-              if (merged !== current) {
-                setPetInfo(merged)
-              }
+              setPetInfo(mergePetInfoMeta(current, meta))
 
               return
             }
           } catch {
+            if (cancelled) {
+              return
+            }
+
             // Older gateways may not have pet.info.meta yet; fall back to pet.info.
           }
         }
@@ -195,7 +188,7 @@ export function FloatingPet() {
 
         const next = await requestGateway<PetInfo & { spritesheetUnchanged?: boolean }>('pet.info', {
           knownRevision,
-          profile: petProfile()
+          profile
         })
 
         if (!cancelled && next) {
@@ -267,7 +260,15 @@ export function FloatingPet() {
 
       window.clearInterval(timer)
     }
-  }, [gatewayState, active, changeEventsAvailable, petChange, requestGateway])
+  }, [gatewayState, gatewayProfile, active, changeEventsAvailable, petChange, requestGateway])
+
+  // Apply a disabled hint once per event, independently of reconciliation.
+  // Replaying it when `active` changes would hide a pet the backstop recovered.
+  useEffect(() => {
+    if (gatewayState === 'open' && changeEventsAvailable && petChange.tick > 0 && petChange.meta?.enabled === false) {
+      setPetInfo({ enabled: false })
+    }
+  }, [gatewayState, changeEventsAvailable, petChange])
 
   // Pets are per-profile. When the active profile changes, drop the previous
   // profile's mascot + gallery cache so the poll above refetches the new
