@@ -403,6 +403,15 @@ def _base_kwargs(model: str, sanitized: list, tools: Any, params: dict, profile:
     if params.get("timeout") is not None:
         api_kwargs["timeout"] = params["timeout"]
     if tools:
+        # Keep the general model-facing schema faithful to property-less free-form objects. Only
+        # llama.cpp needs an empty ``properties`` map for grammar conversion; its wire-only pass
+        # pairs that map with ``additionalProperties: true`` so the object is not closed by intent.
+        from hermes_cli.local_runtime.capabilities import is_managed_provider
+        if params.get("require_object_properties") or is_managed_provider(
+            params.get("schema_provider_name") or params.get("provider_name"), params.get("base_url")
+        ):
+            from tools.schema_sanitizer import sanitize_tool_schemas
+            tools = sanitize_tool_schemas(tools, require_object_properties=True)
         # Moonshot/Kimi uses a stricter JSON Schema flavor; rewriting here also covers aggregator routes.
         api_kwargs["tools"] = sanitize_moonshot_tools(tools) if is_moonshot_model(model) else tools
     return api_kwargs

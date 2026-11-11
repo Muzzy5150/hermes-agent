@@ -2256,7 +2256,7 @@ class TestSamplingCallbackText:
         assert _stop_reason(result) == "endTurn"
 
     def test_server_tools_with_object_schema_are_normalized(self):
-        """Server-provided tools should gain empty properties for object schemas."""
+        """Server tools gain a valid root property map without losing free-form intent."""
         fake_client = MagicMock()
         fake_client.chat.completions.create.return_value = _make_llm_response()
         server_tool = SimpleNamespace(
@@ -2278,7 +2278,7 @@ class TestSamplingCallbackText:
             "function": {
                 "name": "ask",
                 "description": "Ask Crawl4AI",
-                "parameters": {"type": "object", "properties": {}, "required": []},
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": True, "required": []},
             },
         }]
 

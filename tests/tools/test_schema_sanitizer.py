@@ -22,23 +22,80 @@ def _tool(name: str, parameters: dict) -> dict:
 def test_object_without_properties_gets_empty_properties():
     tools = [_tool("t", {"type": "object"})]
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}, "required": []}
+    assert out[0]["function"]["parameters"] == {
+        "type": "object", "properties": {}, "additionalProperties": True, "required": [],
+    }
 
 
-def test_nested_object_without_properties_gets_empty_properties():
+def test_nested_free_form_object_preserves_absent_properties():
     tools = [_tool("t", {
         "type": "object",
         "properties": {
             "name": {"type": "string"},
-            "arguments": {"type": "object", "description": "free-form"},
+            "frontmatter_findings": {
+                "type": "object",
+                "description": "Free-form findings keyed by id",
+            },
         },
         "required": ["name"],
     })]
     out = sanitize_tool_schemas(tools)
-    args = out[0]["function"]["parameters"]["properties"]["arguments"]
-    assert args["type"] == "object"
-    assert args["properties"] == {}
-    assert args["description"] == "free-form"
+    findings = out[0]["function"]["parameters"]["properties"]["frontmatter_findings"]
+    assert findings == {
+        "type": "object",
+        "description": "Free-form findings keyed by id",
+        "required": [],
+    }
+
+
+def test_strict_object_shapes_keep_free_form_intent_explicit():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"payload": {"type": "object", "description": "arbitrary keys"}},
+    })]
+    out = sanitize_tool_schemas(tools, require_object_properties=True)
+    assert out[0]["function"]["parameters"]["properties"]["payload"] == {
+        "type": "object",
+        "description": "arbitrary keys",
+        "properties": {},
+        "additionalProperties": True,
+        "required": [],
+    }
+
+
+def test_top_level_free_form_object_stays_provider_compatible():
+    out = sanitize_tool_schemas([_tool("t", {"type": "object", "description": "arbitrary keys"})])
+    assert out[0]["function"]["parameters"] == {
+        "type": "object",
+        "description": "arbitrary keys",
+        "properties": {},
+        "additionalProperties": True,
+        "required": [],
+    }
+
+
+def test_closed_propertyless_object_stays_closed():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"payload": {"type": "object", "additionalProperties": False}},
+    })]
+    payload = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]["payload"]
+    assert payload == {
+        "type": "object", "additionalProperties": False, "properties": {}, "required": [],
+    }
+
+
+def test_declared_map_preserves_value_schema_without_empty_properties():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "scores": {"type": "object", "additionalProperties": {"type": "number"}},
+        },
+    })]
+    scores = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]["scores"]
+    assert scores == {
+        "type": "object", "additionalProperties": {"type": "number"}, "required": [],
+    }
 
 
 def test_bare_string_object_value_replaced_with_schema_dict():
@@ -54,7 +111,7 @@ def test_bare_string_object_value_replaced_with_schema_dict():
     payload = out[0]["function"]["parameters"]["properties"]["payload"]
     assert isinstance(payload, dict)
     assert payload["type"] == "object"
-    assert payload["properties"] == {}
+    assert "properties" not in payload
 
 
 def test_nullable_type_array_collapsed_to_single_string():
@@ -129,7 +186,7 @@ def test_anyof_nested_objects_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     variants = out[0]["function"]["parameters"]["properties"]["opt"]["anyOf"]
-    assert variants[0] == {"type": "object", "properties": {}, "required": []}
+    assert variants[0] == {"type": "object", "required": []}
     assert variants[1] == {"type": "string"}
 
 
@@ -195,7 +252,7 @@ def test_additional_properties_schema_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     field = out[0]["function"]["parameters"]["properties"]["dict_field"]
-    assert field["additionalProperties"] == {"type": "object", "properties": {}, "required": []}
+    assert field["additionalProperties"] == {"type": "object", "required": []}
 
 
 def test_items_sanitized_in_array_schema():
@@ -210,7 +267,24 @@ def test_items_sanitized_in_array_schema():
     })]
     out = sanitize_tool_schemas(tools)
     items = out[0]["function"]["parameters"]["properties"]["bag"]["items"]
-    assert items == {"type": "object", "properties": {}, "required": []}
+    assert items == {"type": "object", "required": []}
+
+
+def test_free_form_sanitization_is_immutable_and_idempotent():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "payload": {"type": "object", "description": "arbitrary keys"},
+            "rows": {"type": "array", "items": {"type": "object"}},
+        },
+    })]
+    snapshot = copy.deepcopy(tools)
+    once = sanitize_tool_schemas(tools)
+    twice = sanitize_tool_schemas(once)
+    assert tools == snapshot
+    assert twice == once
+    strict_once = sanitize_tool_schemas(tools, require_object_properties=True)
+    assert sanitize_tool_schemas(strict_once, require_object_properties=True) == strict_once
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -349,13 +423,13 @@ def test_dependent_schemas_still_recursively_sanitized():
             "owner": {"type": "string"},
         },
         "dependentSchemas": {
-            "owner": {"type": "object"},  # bare object -- needs properties: {}
+            "owner": {"type": "object"},  # free-form object schema
         },
     }
     tools = [_tool("t", copy.deepcopy(schema))]
     out = sanitize_tool_schemas(tools)
     dep_schemas = out[0]["function"]["parameters"]["dependentSchemas"]
-    assert dep_schemas["owner"] == {"type": "object", "properties": {}, "required": []}, (
+    assert dep_schemas["owner"] == {"type": "object", "required": []}, (
         f"dependentSchemas['owner'] was not fully sanitized: {dep_schemas['owner']!r}"
     )
 
@@ -574,6 +648,52 @@ def test_normalize_mcp_input_schema_still_repairs_declared_objects():
     assert out["properties"]["opts"] == {"type": "object", "properties": {"x": {"type": "string"}}, "required": []}
     bare = _normalize_mcp_input_schema({"type": "object", "required": ["a"]})
     assert bare["properties"] == {} and bare["required"] == []
+
+
+def test_normalize_mcp_input_schema_preserves_nested_free_form_object():
+    from tools.mcp_tool_schema import _normalize_mcp_input_schema
+
+    source = {
+        "type": "object",
+        "properties": {
+            "frontmatter_findings": {
+                "type": "object", "description": "Free-form findings keyed by id",
+            },
+        },
+    }
+    snapshot = copy.deepcopy(source)
+    out = _normalize_mcp_input_schema(source)
+    assert out["properties"]["frontmatter_findings"] == {
+        "type": "object", "description": "Free-form findings keyed by id", "required": [],
+    }
+    assert out["properties"] is not source["properties"]
+    assert source == snapshot
+
+    top = _normalize_mcp_input_schema({"type": "object", "description": "arbitrary keys"})
+    assert top == {
+        "type": "object", "description": "arbitrary keys", "properties": {},
+        "additionalProperties": True, "required": [],
+    }
+
+
+def test_provider_specific_schema_passes_keep_free_form_contract_valid():
+    from agent.gemini_schema import prepare_gemini_tool_parameters, sanitize_gemini_tool_parameters
+    from agent.moonshot_schema import sanitize_moonshot_tool_parameters
+
+    params = sanitize_tool_schemas([_tool("t", {
+        "type": "object",
+        "properties": {"payload": {"type": "object", "description": "arbitrary keys"}},
+    })])[0]["function"]["parameters"]
+
+    full_gemini = prepare_gemini_tool_parameters(params)
+    legacy_gemini = sanitize_gemini_tool_parameters(params)
+    moonshot = sanitize_moonshot_tool_parameters(params)
+
+    assert "properties" not in full_gemini["properties"]["payload"]
+    assert "properties" not in legacy_gemini["properties"]["payload"]
+    assert moonshot["properties"]["payload"] == {
+        "type": "object", "description": "arbitrary keys", "required": [],
+    }
 
 
 

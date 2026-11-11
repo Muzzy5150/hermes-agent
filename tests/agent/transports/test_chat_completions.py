@@ -19,6 +19,50 @@ def transport():
 
 
 class TestChatCompletionsBasic:
+    def test_llamacpp_repairs_propertyless_objects_without_closing_them(self, transport):
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "finalize",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "frontmatter_findings": {
+                            "type": "object", "description": "Free-form findings keyed by id",
+                        },
+                    },
+                },
+            },
+        }]
+
+        kwargs = transport.build_kwargs(
+            model="local-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            provider_name="llamacpp",
+            base_url="http://127.0.0.1:8080/v1",
+        )
+
+        findings = kwargs["tools"][0]["function"]["parameters"]["properties"]["frontmatter_findings"]
+        assert findings["properties"] == {}
+        assert findings["additionalProperties"] is True
+        assert findings["required"] == []
+        assert "properties" not in tools[0]["function"]["parameters"]["properties"]["frontmatter_findings"]
+
+        profile_kwargs = transport.build_kwargs(
+            model="local-model",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=tools,
+            provider_profile=get_provider_profile("custom"),
+            schema_provider_name="llamacpp",
+            base_url="http://127.0.0.1:8080/v1",
+        )
+        profile_findings = (
+            profile_kwargs["tools"][0]["function"]["parameters"]["properties"]["frontmatter_findings"]
+        )
+        assert profile_findings["properties"] == {}
+        assert profile_findings["additionalProperties"] is True
+
     @pytest.mark.parametrize(
         "choice",
         [SimpleNamespace(message=SimpleNamespace()), SimpleNamespace()],

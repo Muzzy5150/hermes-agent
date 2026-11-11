@@ -2,6 +2,8 @@
 ``{"type": "object"}`` without ``properties``, bare-string schemas and ``type`` arrays; Anthropic
 rejects nullable ``anyOf`` at the top of ``input_schema``; Fireworks rejects ``default`` beside
 ``$ref``; Codex rejects top-level combinators. Walks a deep copy and fixes only those shapes.
+Property-less nested objects remain free-form unless the llama.cpp compatibility mode is requested;
+that mode adds ``properties: {}`` together with an explicit ``additionalProperties: true`` marker.
 Legacy boolean ``required`` flags are removed from schema positions, lifting property-level
 ``true`` flags into the parent's required-name list; literal defaults/consts are not schemas."""
 
@@ -130,12 +132,17 @@ def unrename_tool_args(params_schema: Any, args: Any, root_schema: Any = None) -
     return out
 
 
-def sanitize_tool_schemas(tools: list[dict]) -> list[dict]:
-    """Deep-copied ``tools`` (OpenAI format) with sanitized parameter schemas; safe to mutate."""
-    return [_sanitize_single_tool(tool) for tool in tools] if tools else tools
+def sanitize_tool_schemas(tools: list[dict], *, require_object_properties: bool = False) -> list[dict]:
+    """Deep-copied ``tools`` (OpenAI format) with sanitized parameter schemas; safe to mutate.
+
+    ``require_object_properties`` is the final-wire compatibility mode for llama.cpp grammar
+    conversion. It keeps property-less objects parseable without erasing their free-form intent.
+    """
+    return ([_sanitize_single_tool(tool, require_object_properties=require_object_properties)
+             for tool in tools] if tools else tools)
 
 
-def _sanitize_single_tool(tool: dict) -> dict:
+def _sanitize_single_tool(tool: dict, *, require_object_properties: bool = False) -> dict:
     out = copy.deepcopy(tool)
     fn = out.get("function") if isinstance(out, dict) else None
     if not isinstance(fn, dict):
@@ -145,11 +152,18 @@ def _sanitize_single_tool(tool: dict) -> dict:
         fn["parameters"] = _empty_object()
         return out
     name = fn.get("name", "<tool>")
-    top = _sanitize_node(params, path=name)
+    top = _sanitize_node(params, path=name, require_object_properties=require_object_properties)
     top = top if isinstance(top, dict) else {}  # guarantee an object with properties on top
+    free_form_top = (
+        top.get("type") == "object"
+        and "properties" not in top
+        and "additionalProperties" not in top
+    )
     top["type"] = "object"
     if not isinstance(top.get("properties"), dict):
         top["properties"] = {}
+    if free_form_top:
+        top["additionalProperties"] = True
     if not isinstance(top.get("required"), list):
         top["required"] = []
     # The recursive pass only handles array-form ``type: [X, "null"]``; collapse anyOf unions
@@ -294,11 +308,31 @@ def _normalize_type_array(value: list, out: dict) -> None:
         out.setdefault("nullable", True)
 
 
-def _sanitize_node(node: Any, path: str) -> Any:
+def _normalize_object_shape(out: dict, *, require_object_properties: bool) -> dict:
+    """Finish one object node without confusing absent properties with an empty declaration."""
+    if out.get("type") != "object":
+        return out
+    if "properties" in out and not isinstance(out.get("properties"), dict):
+        out["properties"] = {}
+    if out.get("additionalProperties") is False and not isinstance(out.get("properties"), dict):
+        out["properties"] = {}
+    if require_object_properties and not isinstance(out.get("properties"), dict):
+        out["properties"] = {}
+        out.setdefault("additionalProperties", True)
+    # Always emit a list: ``required: []`` is valid everywhere, while a missing or
+    # non-list key reads as ``null`` on strict OpenAI-compatible proxies (#56123).
+    required, props = out.get("required"), out.get("properties")
+    out["required"] = ([r for r in required if isinstance(r, str) and r in props]
+                       if isinstance(required, list) and isinstance(props, dict) else [])
+    return out
+
+
+def _sanitize_node(node: Any, path: str, *, require_object_properties: bool = False) -> Any:
     """Recursively sanitize a JSON-Schema fragment: bare-string schemas → ``{"type": <value>}``
-    (unknown strings → permissive object); object nodes gain ``properties: {}``; ``type`` arrays
-    are normalized; property keys are renamed to the provider-safe pattern and ``required``
-    follows, with entries missing from ``properties`` pruned.
+    (unknown strings → permissive object); property-less object nodes retain that free-form shape
+    unless ``require_object_properties`` is set; ``type`` arrays are normalized; property keys are
+    renamed to the provider-safe pattern and ``required`` follows, with entries missing from
+    ``properties`` pruned.
 
     - Normalizes ``type: [X, "null"]`` arrays to single ``type: X`` (keeping ``nullable: true`` as a hint),
     and multi-type arrays like ``["number", "string"]`` to an ``anyOf`` of single-type schemas so no branch
@@ -309,12 +343,16 @@ def _sanitize_node(node: Any, path: str) -> Any:
         if node in _BARE_TYPE_NAMES:
             logger.debug("schema_sanitizer[%s]: replacing bare-string schema %r with {'type': %r}",
                          path, node, node)
-            return _empty_object() if node == "object" else {"type": node}
+            if node != "object":
+                return {"type": node}
+            return ({"type": "object", "properties": {}, "additionalProperties": True, "required": []}
+                    if require_object_properties else {"type": "object", "required": []})
         logger.debug("schema_sanitizer[%s]: replacing non-schema string %r "
                      "with empty object schema", path, node)
         return _empty_object()
     if isinstance(node, list):
-        return [_sanitize_node(item, f"{path}[{i}]") for i, item in enumerate(node)]
+        return [_sanitize_node(item, f"{path}[{i}]", require_object_properties=require_object_properties)
+                for i, item in enumerate(node)]
     if not isinstance(node, dict):
         return node
     # Renames computed up front so ``required`` remaps even when it precedes ``properties``.
@@ -338,14 +376,19 @@ def _sanitize_node(node: Any, path: str) -> Any:
         elif key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
             renames = prop_renames if key == "properties" else {}
             out[key] = {
-                renames.get(k, k): _sanitize_node(v, f"{path}.{key}.{renames.get(k, k)}")
+                renames.get(k, k): _sanitize_node(
+                    v, f"{path}.{key}.{renames.get(k, k)}",
+                    require_object_properties=require_object_properties)
                 for k, v in value.items()}
         elif key == "dependencies" and isinstance(value, dict):
-            out[key] = {k: _sanitize_node(v, f"{path}.{key}.{k}") if isinstance(v, dict)
+            out[key] = {k: _sanitize_node(
+                            v, f"{path}.{key}.{k}",
+                            require_object_properties=require_object_properties) if isinstance(v, dict)
                         else copy.deepcopy(v) for k, v in value.items()}
         elif key in {"items", "additionalProperties"}:
             # Bool ``additionalProperties`` is valid; bool ``items`` is non-standard but preserved.
-            out[key] = value if isinstance(value, bool) else _sanitize_node(value, f"{path}.{key}")
+            out[key] = (value if isinstance(value, bool) else _sanitize_node(
+                value, f"{path}.{key}", require_object_properties=require_object_properties))
         elif key in _NON_SCHEMA_LIST_KEYS:
             if key == "required" and isinstance(value, bool):
                 continue  # Legacy property flags are lifted by the parent below.
@@ -354,7 +397,8 @@ def _sanitize_node(node: Any, path: str) -> Any:
             else:
                 out[key] = copy.deepcopy(value) if isinstance(value, (list, dict)) else value
         elif key in _SCHEMA_CHILD_KEYS:
-            out[key] = _sanitize_node(value, f"{path}.{key}")
+            out[key] = _sanitize_node(
+                value, f"{path}.{key}", require_object_properties=require_object_properties)
         else:
             # Defaults, consts and extension metadata are literal data, not schemas.
             out[key] = copy.deepcopy(value)
@@ -365,15 +409,7 @@ def _sanitize_node(node: Any, path: str) -> Any:
             required = out.get("required", [])
             required = required if isinstance(required, list) else []
             out["required"] = required + [key for key in lifted if key not in required]
-    if out.get("type") == "object":
-        if not isinstance(out.get("properties"), dict):
-            out["properties"] = {}
-        # Always emit a list: ``required: []`` is valid everywhere, while a missing or
-        # non-list key reads as ``null`` on strict OpenAI-compatible proxies (#56123).
-        required = out.get("required")
-        out["required"] = ([r for r in required if isinstance(r, str) and r in out["properties"]]
-                           if isinstance(required, list) else [])
-    return out
+    return _normalize_object_shape(out, require_object_properties=require_object_properties)
 
 
 # ---- Reactive strips — only invoked after a backend rejects a schema ----

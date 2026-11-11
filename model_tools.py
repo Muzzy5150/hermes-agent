@@ -534,8 +534,8 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
     if not quiet_mode:
         print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(_last_resolved_tool_names)}"
               if filtered_tools else "🛠️  No tools selected (all filtered out or unavailable)")
-    # Normalize schema shapes llama.cpp's grammar converter rejects (bare
-    # "type": "object", string-valued nodes from malformed MCP servers).
+    # Normalize malformed/provider-hostile schema shapes while preserving property-less
+    # free-form objects. llama.cpp's extra object-shape repair runs at its transport boundary.
     try:
         from tools.schema_sanitizer import sanitize_tool_schemas
         filtered_tools = sanitize_tool_schemas(filtered_tools)
